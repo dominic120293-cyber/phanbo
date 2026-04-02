@@ -98,6 +98,35 @@ def _make_solver(time_limit=120):
     return pulp.PULP_CBC_CMD(msg=True, timeLimit=time_limit)
 
 # ============================================================
+# MOVE HOUR SORT KEY
+# Format: +MO0600, +TU1200, +WE0000, +TH1800, +FR0000, +SA0600, +SU2200
+# Không thể sort alphabet vì +TH < +WE theo ABC nhưng TH > WE theo lịch
+# ============================================================
+_DAY_RANK = {'MO': 0, 'TU': 1, 'WE': 2, 'TH': 3, 'FR': 4, 'SA': 5, 'SU': 6}
+
+def _hour_sort_key(h: str):
+    """
+    Trả về tuple (day_rank, time_int) để sort đúng thứ tự tuần.
+    Ví dụ: '+WE0600' → (2, 600),  '+TH0000' → (3, 0)
+    → +WE0600 < +TH0000 ✓
+    Fallback về (99, h) nếu format lạ → không crash.
+    """
+    s = str(h).strip()
+    # Bỏ dấu '+' ở đầu nếu có
+    if s.startswith('+'):
+        s = s[1:]
+    if len(s) >= 2:
+        day_code = s[:2].upper()
+        time_str = s[2:].strip()
+        day_rank = _DAY_RANK.get(day_code, 99)
+        try:
+            time_int = int(time_str) if time_str else 0
+        except ValueError:
+            time_int = 0
+        return (day_rank, time_int)
+    return (99, s)  # fallback
+
+# ============================================================
 # PUBLIC API
 # ============================================================
 def run_optimization(file_input):
@@ -143,7 +172,9 @@ def run_optimization(file_input):
 
     print(f"Demand format: {'WC+ST+POD' if has_st_pod else 'WC only'}")
     job_keys = list(demands.keys())
-    all_hours_sorted = sorted(set(h for (h, s, b) in job_keys))
+    # Dùng _hour_sort_key để sort đúng thứ tự tuần (+MO → +TU → ... → +SU)
+    # thay vì sort alphabet (sẽ đặt +TH trước +WE vì T < W)
+    all_hours_sorted = sorted(set(h for (h, s, b) in job_keys), key=_hour_sort_key)
     hour_rank = {h: i for i, h in enumerate(all_hours_sorted)}
     jobs_by_hour = defaultdict(list)
     for (h, s, b) in job_keys:
@@ -410,7 +441,9 @@ def run_optimization(file_input):
                         'ST': st_v, 'POD': pod_v, 'QUANTITIES': int(round(qty))
                     })
     df_result = pd.DataFrame(result_rows)
-    df_result.sort_values(['MOVE HOUR','STS','BAY','ASSIGNED BLOCK'], inplace=True)
+    df_result['_sort_hr'] = df_result['MOVE HOUR'].map(hour_rank)
+    df_result.sort_values(['_sort_hr','STS','BAY','ASSIGNED BLOCK'], inplace=True)
+    df_result.drop(columns=['_sort_hr'], inplace=True)
 
     df_result_detail = []
     if container_data_available:
@@ -541,9 +574,11 @@ def run_optimization(file_input):
         df_result_detail['YT'] = ''
         df_result_detail['YARD POSITION'] = ''
 
+    df_result_detail['_sort_hr'] = df_result_detail['MOVE HOUR'].map(hour_rank)
     df_result_detail.sort_values(
-        ['MOVE HOUR','STS','BAY','ASSIGNED BLOCK','WEIGHT CLASS','YB','YR','YT'],
+        ['_sort_hr','STS','BAY','ASSIGNED BLOCK','WEIGHT CLASS','YB','YR','YT'],
         inplace=True)
+    df_result_detail.drop(columns=['_sort_hr'], inplace=True)
 
     t_assign = time.perf_counter()
     print(f"[TIMER] Gán containers: {t_assign - t_solve:.1f}s")
@@ -569,7 +604,9 @@ def run_optimization(file_input):
             })
     df_clash = pd.DataFrame(clash_details)
     if not df_clash.empty:
-        df_clash.sort_values(['MOVE HOUR','BLOCK'], inplace=True)
+        df_clash['_sort_hr'] = df_clash['MOVE HOUR'].map(hour_rank)
+        df_clash.sort_values(['_sort_hr','BLOCK'], inplace=True)
+        df_clash.drop(columns=['_sort_hr'], inplace=True)
     print(f"Total clashes: {total_clashes}")
 
     # ============================================================
