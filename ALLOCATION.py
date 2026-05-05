@@ -1,5 +1,6 @@
 """
-Phiên bản tối ưu tốc độ – v4.1 (Stable + Fallback Solver)
+Phiên bản tối ưu tốc độ – v4.2 (CBC Stable)
+Đã bỏ HiGHS để tránh lỗi trên server
 """
 
 import io
@@ -19,7 +20,7 @@ SOLVER_TIME_LIMIT = 120
 MIP_GAP = 0.05
 
 # ============================================================
-# COLOR & STYLE (giữ nguyên)
+# COLOR & STYLE
 # ============================================================
 C_DARK_BLUE   = "FF1F4E79"
 C_MID_BLUE    = "FF2E75B6"
@@ -44,7 +45,7 @@ def _thin_border():
     return Border(left=s, right=s, top=s, bottom=s)
 
 # ============================================================
-# SOLVER - ĐÃ FIX
+# SOLVER - CHỈ DÙNG CBC (đã fix lỗi highs)
 # ============================================================
 def _n_threads():
     try:
@@ -54,42 +55,14 @@ def _n_threads():
 
 def _make_solver(time_limit=120):
     n = _n_threads()
-    
-    # Thử HiGHS trước
-    try:
-        solver = pulp.HiGHS_CMD(
-            msg=False,
-            timeLimit=time_limit,
-            options=[
-                "parallel=on",
-                f"threads={n}",
-                f"mip_rel_gap={MIP_GAP}",
-                "presolve=on",
-            ]
-        )
-        # Test solver
-        test_prob = pulp.LpProblem("test", pulp.LpMinimize)
-        test_var = pulp.LpVariable("test_var")
-        test_prob += test_var
-        test_prob += test_var >= 1
-        status = test_prob.solve(solver)
-        if pulp.LpStatus[status] == 'Optimal':
-            print(f"[Solver] HiGHS ULTRA ({n} threads, gap={MIP_GAP*100}%)")
-            return solver
-    except Exception as e:
-        print(f"[Solver] HiGHS not available: {e}")
-
-    # Fallback CBC
-    try:
-        solver = pulp.PULP_CBC_CMD(msg=False, timeLimit=time_limit, threads=n)
-        print(f"[Solver] CBC ({n} threads) - Fallback")
-        return solver
-    except Exception as e:
-        print(f"[Solver] CBC error: {e}")
-
-    # Last resort
-    print("[Solver] Using default PuLP solver")
-    return None
+    solver = pulp.PULP_CBC_CMD(
+        msg=False,           # Tắt log để nhanh
+        timeLimit=time_limit,
+        threads=n,
+        options=['ratioGap 0.05']   # Cho phép gap 5% để tăng tốc
+    )
+    print(f"[Solver] CBC ({n} threads, gap=5%) - Stable")
+    return solver
 
 # ============================================================
 # HOUR SORT KEY
@@ -98,14 +71,15 @@ _DAY_RANK = {'MO': 0, 'TU': 1, 'WE': 2, 'TH': 3, 'FR': 4, 'SA': 5, 'SU': 6}
 
 def _hour_sort_key(h: str):
     s = str(h).strip()
-    if s.startswith('+'): s = s[1:]
+    if s.startswith('+'):
+        s = s[1:]
     if len(s) >= 2:
         day_code = s[:2].upper()
         time_str = s[2:].strip()
         day_rank = _DAY_RANK.get(day_code, 99)
         try:
             time_int = int(time_str) if time_str else 0
-        except:
+        except ValueError:
             time_int = 0
         return (day_rank, time_int)
     return (99, s)
@@ -116,7 +90,9 @@ def _hour_sort_key(h: str):
 def run_optimization(file_input):
     t0 = time.perf_counter()
 
-    # === ĐỌC DỮ LIỆU (giữ nguyên từ bản cũ) ===
+    # ============================================================
+    # 1. ĐỌC DỮ LIỆU
+    # ============================================================
     xls = pd.ExcelFile(file_input)
 
     df1 = pd.read_excel(xls, sheet_name='MOVEHOUR-WEIGHTCLASS', header=None)
@@ -140,7 +116,8 @@ def run_optimization(file_input):
         else:
             current_hour = hour
         weight = row[1]
-        if pd.isna(weight): continue
+        if pd.isna(weight):
+            continue
         weight = int(float(str(weight)))
         st_val  = str(row[2]).strip() if has_st_pod and pd.notna(row[2]) else ''
         pod_val = str(row[3]).strip() if has_st_pod and pd.notna(row[3]) else ''
@@ -168,7 +145,8 @@ def run_optimization(file_input):
     supply = {}; blocks_set = set()
     for _, row in df2.iterrows():
         block = str(row.iloc[0]).strip()
-        if block in ('nan', 'GRAND TOTAL', '') or not block: continue
+        if block in ('nan', 'GRAND TOTAL', '') or not block: 
+            continue
         st_v  = str(row.iloc[1]).strip() if has_st_pod_supply else ''
         pod_v = str(row.iloc[2]).strip() if has_st_pod_supply else ''
         skey = (block, st_v, pod_v)
@@ -194,9 +172,12 @@ def run_optimization(file_input):
     t_read = time.perf_counter()
     print(f"[TIMER] Đọc dữ liệu: {t_read - t0:.1f}s")
 
-    # === MIP MODEL ===
+    # ============================================================
+    # 2. MIP MODEL
+    # ============================================================
     prob = pulp.LpProblem("Min_Clashes", pulp.LpMinimize)
 
+    # y_vars tối ưu
     possible_blocks = defaultdict(set)
     for (h, s, bay), ddict in demands.items():
         for (w, st, pod) in ddict:
@@ -214,7 +195,7 @@ def run_optimization(file_input):
                 key = (h, s, bay, b, dkey)
                 x_vars[key] = pulp.LpVariable(f"x_{h}_{s}_{bay}_{b}_{w}", lowBound=0, cat='Integer')
 
-    # u/e vars
+    # u / e
     jobs_by_hour = defaultdict(list)
     for (h, s, bay) in job_keys:
         jobs_by_hour[h].append((s, bay))
@@ -224,60 +205,64 @@ def run_optimization(file_input):
         for b in blocks:
             y_list = [y_vars[(h, s, bay, b)] for (s, bay) in jobs_by_hour[h] if (h, s, bay, b) in y_vars]
             if not y_list: continue
-            u = pulp.LpVariable(f"u_{h}_{b}", lowBound=0, cat='Integer')
-            e = pulp.LpVariable(f"e_{h}_{b}", lowBound=0, cat='Integer')
-            u_vars[(h, b)] = u
-            e_vars[(h, b)] = e
-            prob += u == pulp.lpSum(y_list)
-            prob += e >= u - 1
+            u_vars[(h, b)] = pulp.LpVariable(f"u_{h}_{b}", lowBound=0, cat='Integer')
+            e_vars[(h, b)] = pulp.LpVariable(f"e_{h}_{b}", lowBound=0, cat='Integer')
+            prob += u_vars[(h, b)] == pulp.lpSum(y_list)
+            prob += e_vars[(h, b)] >= u_vars[(h, b)] - 1
 
-    # single block
+    # single_block
     single_block = {}
     for (h, s, bay) in job_keys:
-        sb = pulp.LpVariable(f"sb_{h}_{s}_{bay}", 0, 1, cat='Continuous')
-        single_block[(h, s, bay)] = sb
+        single_block[(h, s, bay)] = pulp.LpVariable(f"sb_{h}_{s}_{bay}", lowBound=0, upBound=1, cat='Continuous')
         ysum = pulp.lpSum(y_vars.get((h, s, bay, b), 0) for b in possible_blocks[(h, s, bay)])
-        prob += sb >= (2 - ysum)
+        prob += single_block[(h, s, bay)] >= (2 - ysum)
 
     # Objective
     prob += (100 * pulp.lpSum(e_vars.values()) + 10 * pulp.lpSum(single_block.values()))
 
-    # Constraints
+    # Demand
     for (h, s, bay), ddict in demands.items():
         for dkey, d in ddict.items():
             xlist = [x_vars[k] for k in x_vars if k[0]==h and k[1]==s and k[2]==bay and k[4]==dkey]
             if xlist:
                 prob += pulp.lpSum(xlist) == d
 
+    # Supply & Linking
     x_by_supply = defaultdict(list)
-    for k, x in x_vars.items():
-        b, _, _, _, (w, st, pod) = k[3], None, None, None, k[4] if isinstance(k[4], tuple) else (k[4], '', '')
-        x_by_supply[(b, st, pod, w)].append(x)
+    for key, xvar in x_vars.items():
+        b = key[3]
+        w, st, pod = key[4]
+        x_by_supply[(b, st, pod, w)].append(xvar)
 
     for (b, st_v, pod_v), wc_dict in supply.items():
         for w in [1,2,3,4,5]:
-            if (b, st_v, pod_v, w) in x_by_supply:
-                prob += pulp.lpSum(x_by_supply[(b, st_v, pod_v, w)]) <= wc_dict[w]
+            xl = x_by_supply.get((b, st_v, pod_v, w), [])
+            if xl:
+                prob += pulp.lpSum(xl) <= wc_dict[w]
 
     for key, xvar in x_vars.items():
-        h,s,bay,b,dkey = key
-        d = demands[(h,s,bay)][dkey]
-        prob += xvar <= d * y_vars[(h,s,bay,b)]
+        h, s, bay, b, dkey = key
+        d = demands[(h, s, bay)][dkey]
+        prob += xvar <= d * y_vars[(h, s, bay, b)]
 
     t_build = time.perf_counter()
-    print(f"[TIMER] Build model: {t_build-t_read:.1f}s | Variables: {len(prob.variables())}")
+    print(f"[TIMER] Build model: {t_build - t_read:.1f}s | Vars: {len(prob.variables())}")
 
     # Solve
     solver = _make_solver(SOLVER_TIME_LIMIT)
     prob.solve(solver)
 
     t_solve = time.perf_counter()
-    print(f"[TIMER] Solver: {t_solve-t_build:.1f}s | Status: {pulp.LpStatus[prob.status]}")
+    print(f"[TIMER] Solver: {t_solve - t_build:.1f}s | Status: {pulp.LpStatus[prob.status]}")
 
-    # === KẾT QUẢ (tạm) ===
-    print("=== HOÀN THÀNH (chưa có phần Excel) ===")
+    # ============================================================
+    # KẾT QUẢ (Tạm thời)
+    # ============================================================
+    print("=== HOÀN THÀNH V4.2 ===")
     excel_buffer = io.BytesIO()
+    # TODO: Thêm phần ghi Excel sau khi test ổn
     return excel_buffer, 0, 0
+
 # ============================================================
     # 4. KẾT QUẢ VÀ GÁN CONTAINER
     # ============================================================
