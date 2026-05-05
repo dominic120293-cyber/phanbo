@@ -1,6 +1,10 @@
 """
 Phiên bản tối ưu tốc độ – v4 ULTRA FAST
-Cải tiến: Giảm mạnh biến MIP + HiGHS tuning + pre-indexing
+============================
+Giảm mạnh thời gian MIP nhờ:
+- ULTRA_FAST + possible_blocks filtering
+- HiGHS với mip_rel_gap
+- Giảm biến và ràng buộc không cần thiết
 """
 
 import io
@@ -15,12 +19,12 @@ from collections import defaultdict
 # ============================================================
 # TUNING FLAGS
 # ============================================================
-ULTRA_FAST = True           # Bật để nhanh nhất
+ULTRA_FAST = True           # ← Bật cái này để nhanh nhất
 SOLVER_TIME_LIMIT = 90
 MIP_GAP = 0.05
 
 # ============================================================
-# COLOR & STYLE
+# COLOR PALETTE & STYLE
 # ============================================================
 C_DARK_BLUE   = "FF1F4E79"
 C_MID_BLUE    = "FF2E75B6"
@@ -45,12 +49,12 @@ def _thin_border():
     return Border(left=s, right=s, top=s, bottom=s)
 
 # ============================================================
-# SOLVER
+# SOLVER HELPER
 # ============================================================
 def _n_threads():
     try:
         return max(1, os.cpu_count() or 1)
-    except:
+    except Exception:
         return 1
 
 def _make_solver(time_limit=90):
@@ -74,7 +78,7 @@ def _make_solver(time_limit=90):
         return pulp.PULP_CBC_CMD(msg=False, timeLimit=time_limit, threads=n)
 
 # ============================================================
-# HOUR SORT
+# MOVE HOUR SORT KEY
 # ============================================================
 _DAY_RANK = {'MO': 0, 'TU': 1, 'WE': 2, 'TH': 3, 'FR': 4, 'SA': 5, 'SU': 6}
 
@@ -94,12 +98,14 @@ def _hour_sort_key(h: str):
     return (99, s)
 
 # ============================================================
-# MAIN
+# MAIN FUNCTION
 # ============================================================
 def run_optimization(file_input):
     t0 = time.perf_counter()
 
-    # ====================== 1. READ DATA ======================
+    # ============================================================
+    # 1. ĐỌC DỮ LIỆU
+    # ============================================================
     xls = pd.ExcelFile(file_input)
 
     df1 = pd.read_excel(xls, sheet_name='MOVEHOUR-WEIGHTCLASS', header=None)
@@ -123,7 +129,7 @@ def run_optimization(file_input):
         else:
             current_hour = hour
         weight = row[1]
-        if pd.isna(weight): 
+        if pd.isna(weight):
             continue
         weight = int(float(str(weight)))
         st_val  = str(row[2]).strip() if has_st_pod and pd.notna(row[2]) else ''
@@ -146,11 +152,10 @@ def run_optimization(file_input):
     # Supply
     df2 = pd.read_excel(xls, sheet_name='BLOCK-WEIGHT CLASS', header=0)
     col_names = [str(c).strip() for c in df2.columns]
-    has_st_pod_supply = len(col_names) > 2 and col_names[1].upper() == 'ST'
+    has_st_pod_supply = (len(col_names) > 2 and col_names[1].upper() == 'ST')
     wc_col_start = 3 if has_st_pod_supply else 1
 
-    supply = {}
-    blocks_set = set()
+    supply = {}; blocks_set = set()
     for _, row in df2.iterrows():
         block = str(row.iloc[0]).strip()
         if block in ('nan', 'GRAND TOTAL', '') or not block: 
@@ -181,8 +186,10 @@ def run_optimization(file_input):
     t_read = time.perf_counter()
     print(f"[TIMER] Đọc dữ liệu: {t_read - t0:.1f}s")
 
-    # ====================== 2. MIP MODEL ======================
-    prob = pulp.LpProblem("Min_Clashes", pulp.LpMinimize)
+    # ============================================================
+    # 2. XÂY DỰNG MIP
+    # ============================================================
+    prob = pulp.LpProblem("Minimize_Clashes", pulp.LpMinimize)
 
     # y_vars tối ưu
     possible_blocks = defaultdict(set)
@@ -204,13 +211,12 @@ def run_optimization(file_input):
                 key = (h, s, bay, b, dkey)
                 x_vars[key] = pulp.LpVariable(f"x_{h}_{s}_{bay}_{b}_{w}", lowBound=0, cat='Integer')
 
-    # u, e vars
+    # u / e vars
     jobs_by_hour = defaultdict(list)
     for (h, s, bay) in job_keys:
         jobs_by_hour[h].append((s, bay))
 
-    u_vars = {}
-    e_vars = {}
+    u_vars = {}; e_vars = {}
     for h in jobs_by_hour:
         for b in blocks:
             y_list = [y_vars[(h, s, bay, b)] for (s, bay) in jobs_by_hour[h] 
@@ -234,16 +240,14 @@ def run_optimization(file_input):
     SINGLE_W = 10.0
     prob += (CLASH_W * pulp.lpSum(e_vars.values()) + SINGLE_W * pulp.lpSum(single_block.values()))
 
-    # Constraints
-    # Demand
+    # Demand constraints
     for (h, s, bay), ddict in demands.items():
         for dkey, d in ddict.items():
-            w, st_v, pod_v = dkey
             xlist = [x_vars[k] for k in x_vars if k[0]==h and k[1]==s and k[2]==bay and k[4]==dkey]
             if xlist:
                 prob += pulp.lpSum(xlist) == d
 
-    # Supply
+    # Supply + Linking
     x_by_supply = defaultdict(list)
     for key, xvar in x_vars.items():
         b = key[3]
@@ -256,43 +260,42 @@ def run_optimization(file_input):
             if xl:
                 prob += pulp.lpSum(xl) <= wc_dict[w]
 
-    # Linking x <= d * y
     for (h, s, bay, b, dkey), xvar in x_vars.items():
         d = demands[(h, s, bay)][dkey]
         prob += xvar <= d * y_vars[(h, s, bay, b)]
 
     t_build = time.perf_counter()
-    print(f"[TIMER] Build model: {t_build - t_read:.1f}s | Vars: {len(prob.variables())}")
+    print(f"[TIMER] Build model: {t_build - t_read:.1f}s | Vars={len(prob.variables())}")
 
-    # ====================== SOLVE ======================
+    # Solve
     solver = _make_solver(SOLVER_TIME_LIMIT)
     prob.solve(solver)
 
     t_solve = time.perf_counter()
     print(f"[TIMER] Solver: {t_solve - t_build:.1f}s | Status: {pulp.LpStatus[prob.status]}")
 
-    # ====================== 4. KẾT QUẢ (copy từ v3) ======================
+# ============================================================
+    # 4. KẾT QUẢ VÀ GÁN CONTAINER
+    # ============================================================
     result_rows = []
     for (h, s, bay, b), yvar in y_vars.items():
         yv = pulp.value(yvar)
         if yv is not None and yv > 0.5:
-            for dkey in demands.get((h, s, bay), {}):
+            for dkey in demands[(h, s, bay)]:
                 xkey = (h, s, bay, b, dkey)
-                if xkey in x_vars:
-                    qty = pulp.value(x_vars[xkey])
-                    if qty is not None and qty > 0.5:
-                        w, st_v, pod_v = dkey
-                        result_rows.append({
-                            'MOVE HOUR': h, 'STS': s, 'BAY': bay,
-                            'ASSIGNED BLOCK': b, 'WEIGHT CLASS': w,
-                            'ST': st_v, 'POD': pod_v, 'QUANTITIES': int(round(qty))
-                        })
-
+                if xkey not in x_vars: continue
+                qty = pulp.value(x_vars[xkey])
+                if qty is not None and qty > 0.5:
+                    w, st_v, pod_v = dkey
+                    result_rows.append({
+                        'MOVE HOUR': h, 'STS': s, 'BAY': bay,
+                        'ASSIGNED BLOCK': b, 'WEIGHT CLASS': w,
+                        'ST': st_v, 'POD': pod_v, 'QUANTITIES': int(round(qty))
+                    })
     df_result = pd.DataFrame(result_rows)
-    if not df_result.empty:
-        df_result['_sort_hr'] = df_result['MOVE HOUR'].map(hour_rank)
-        df_result.sort_values(['_sort_hr','STS','BAY','ASSIGNED BLOCK'], inplace=True)
-        df_result.drop(columns=['_sort_hr'], inplace=True)
+    df_result['_sort_hr'] = df_result['MOVE HOUR'].map(hour_rank)
+    df_result.sort_values(['_sort_hr','STS','BAY','ASSIGNED BLOCK'], inplace=True)
+    df_result.drop(columns=['_sort_hr'], inplace=True)
 
     df_result_detail = []
     if container_data_available:
@@ -611,5 +614,6 @@ def run_optimization(file_input):
     return excel_buffer, total_rows, total_clashes
 
     print("=== HOÀN THÀNH V4 ULTRA FAST ===")
-    # Trả về tạm thời để test
-    return None   # ← Thay bằng excel_buffer khi bạn merge xong phần sau
+    # Trả về tạm để test
+    excel_buffer = io.BytesIO()
+    return excel_buffer, 0, 0
