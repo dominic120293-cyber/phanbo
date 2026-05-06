@@ -38,15 +38,7 @@ from collections import defaultdict
 FAST_MODE         = True   # True = bỏ block_bay_wc khỏi MIP (khuyến nghị)
 SOLVER_TIME_LIMIT = 120    # giây
 
-# ============================================================
-# COLORS (dùng cho xlsxwriter – hex 6 ký tự, không có #)
-# ============================================================
-C_DARK_BLUE  = '#1F4E79'
-C_MID_BLUE   = '#2E75B6'
-C_LIGHT_BLUE = '#9DC3E6'
-C_PALE_BLUE  = '#D6E4F0'
-C_ALT_ROW    = '#EBF3FB'
-C_WHITE      = '#FFFFFF'
+
 
 # ============================================================
 # SOLVER HELPER
@@ -629,48 +621,83 @@ def run_optimization(file_input):
     print(f"Total clashes: {total_clashes}")
 
     # =========================================================
-    # 6. GHI EXCEL  [WIN 6] – dùng xlsxwriter thay openpyxl
+    # 6. GHI EXCEL – openpyxl tối ưu
+    #    • Style objects tạo 1 lần, dùng lại cho mọi cell
+    #    • ws.append() bulk-write toàn bộ data (nhanh nhất trong openpyxl)
+    #    • to_dict('records') thay iterrows()  [WIN 7]
+    #    • Merge + style áp dụng sau khi append xong
     # =========================================================
-    import xlsxwriter as xlw
+    import openpyxl
+    from openpyxl.utils import get_column_letter
+    from openpyxl.styles import Alignment, Font, PatternFill, Border, Side
 
-    excel_buffer = io.BytesIO()
-    wb = xlw.Workbook(excel_buffer, {'in_memory': True,
-                                     'strings_to_numbers': True})
+    # ── Style factory (tạo 1 lần) ──
+    def _side():
+        return Side(border_style='thin', color='FF000000')
+    def _border():
+        s = _side()
+        return Border(left=s, right=s, top=s, bottom=s)
+    def _font(bold=False, color='FF000000', size=10):
+        return Font(name='Calibri', bold=bold, color=color, size=size)
+    def _fill(hex6):           # hex6 không có '#'
+        return PatternFill('solid', fgColor=hex6)
+    def _align(h='center', v='center', wrap=False):
+        return Alignment(horizontal=h, vertical=v, wrap_text=wrap)
 
-    def _fmt(**kw):
-        base = {'font_name': 'Calibri', 'font_size': 10, 'border': 1,
-                'align': 'center', 'valign': 'vcenter'}
-        base.update(kw)
-        return wb.add_format(base)
+    # Hex dạng FFRRGGBB cho openpyxl
+    _OX = {
+        'dark':  'FF1F4E79', 'mid':   'FF2E75B6',
+        'light': 'FF9DC3E6', 'pale':  'FFD6E4F0',
+        'alt':   'FFEBF3FB', 'white': 'FFFFFFFF',
+    }
+    BD = _border()
 
-    F = {
-        'hdr_dark':  _fmt(bold=True, bg_color=C_DARK_BLUE,  font_color='white'),
-        'hdr_mid':   _fmt(bold=True, bg_color=C_MID_BLUE,   font_color='white'),
-        'hdr_light': _fmt(bold=True, bg_color=C_LIGHT_BLUE, font_color='black'),
-        'hdr_pale':  _fmt(bold=True, bg_color=C_PALE_BLUE,  font_color='black'),
-        'data_w':    _fmt(bg_color=C_WHITE),
-        'data_a':    _fmt(bg_color=C_ALT_ROW),
-        'cont_list': _fmt(bg_color=C_PALE_BLUE, font_size=9,
-                          text_wrap=True, align='left', valign='top'),
+    # Pre-build các style tuple thường dùng
+    # (font, fill, alignment, border) – gán trực tiếp vào cell
+    _ST = {
+        'hdr_dark':  (_font(bold=True, color='FFFFFFFF'), _fill(_OX['dark']),
+                      _align(wrap=True), BD),
+        'hdr_mid':   (_font(bold=True, color='FFFFFFFF'), _fill(_OX['mid']),
+                      _align(wrap=True), BD),
+        'hdr_light': (_font(bold=True),                   _fill(_OX['light']),
+                      _align(wrap=True), BD),
+        'hdr_pale':  (_font(bold=True),                   _fill(_OX['pale']),
+                      _align(wrap=True), BD),
+        'data_w':    (_font(), _fill(_OX['white']), _align(), BD),
+        'data_a':    (_font(), _fill(_OX['alt']),   _align(), BD),
+        'cont_list': (_font(size=9), _fill(_OX['pale']),
+                      _align(h='left', v='top', wrap=True), BD),
     }
 
+    def _apply(cell, key):
+        f, fi, al, bo = _ST[key]
+        cell.font = f; cell.fill = fi
+        cell.alignment = al; cell.border = bo
+
+    wb = openpyxl.Workbook(); wb.remove(wb.active)
+
     # ── CLASH sheet ──
-    ws_clash    = wb.add_worksheet('CLASH')
-    hdrs_clash  = ['MOVE HOUR', 'BLOCK', 'SỐ LƯỢNG BAY (u)',
-                   'CLASH (e = u-1)', 'DANH SÁCH JOB (STS@BAY)']
-    clash_widths = [14, 12, 18, 18, 50]
-    for ci, (hdr, w) in enumerate(zip(hdrs_clash, clash_widths)):
-        ws_clash.write(0, ci, hdr, F['hdr_dark'])
-        ws_clash.set_column(ci, ci, w)
+    ws_clash   = wb.create_sheet('CLASH')
+    hdrs_clash = ['MOVE HOUR', 'BLOCK', 'SỐ LƯỢNG BAY (u)',
+                  'CLASH (e = u-1)', 'DANH SÁCH JOB (STS@BAY)']
+    clash_col_w = [14, 12, 18, 18, 50]
+    ws_clash.append(hdrs_clash)
+    for ci, (hdr, cw) in enumerate(zip(hdrs_clash, clash_col_w), 1):
+        cell = ws_clash.cell(row=1, column=ci)
+        _apply(cell, 'hdr_dark')
+        ws_clash.column_dimensions[get_column_letter(ci)].width = cw
     if not df_clash.empty:
-        clash_recs = df_clash.to_dict('records')
-        for ri, rec in enumerate(clash_recs, 1):
-            f = F['data_w'] if ri % 2 == 0 else F['data_a']
-            for ci, col in enumerate(hdrs_clash):
-                ws_clash.write(ri, ci, rec.get(col, ''), f)
+        clash_recs = df_clash[hdrs_clash].to_dict('records')   # [WIN 7]
+        for ri, rec in enumerate(clash_recs, 2):
+            ws_clash.append([rec.get(c, '') for c in hdrs_clash])
+            sk = 'data_w' if ri % 2 == 0 else 'data_a'
+            for ci in range(1, 6):
+                _apply(ws_clash.cell(row=ri, column=ci), sk)
     else:
-        ws_clash.merge_range(1, 0, 1, 4,
-                             'Không có clash nào xảy ra.', F['data_w'])
+        ws_clash.append(['Không có clash nào xảy ra.'])
+        ws_clash.merge_cells(start_row=2, start_column=1,
+                             end_row=2,   end_column=5)
+        _apply(ws_clash.cell(row=2, column=1), 'data_w')
 
     # ── Result column config ──
     core_cols     = ['MOVE HOUR', 'CONT LIST', 'CONTAINER ID', 'ST', 'POD',
@@ -688,79 +715,98 @@ def run_optimization(file_input):
     CONT_LIST_SET = {'CONT LIST'}
     CONT_ID_SET   = {'CONTAINER ID', 'ST', 'POD'}
     POS_SET       = set(position_cols)
+    INT_COLS      = {'YB', 'YR', 'YT'}
 
-    def _hdr_fmt_for(cn):
-        if cn in CONT_LIST_SET: return F['hdr_pale']
-        if cn in CONT_ID_SET:   return F['hdr_mid']
-        if cn in POS_SET:       return F['hdr_light']
-        return F['hdr_dark']
+    def _hdr_key(cn):
+        if cn in CONT_LIST_SET: return 'hdr_pale'
+        if cn in CONT_ID_SET:   return 'hdr_mid'
+        if cn in POS_SET:       return 'hdr_light'
+        return 'hdr_dark'
 
-    cl_col_idx = (all_result_cols.index('CONT LIST')
-                  if 'CONT LIST' in all_result_cols else None)
+    cl_idx = (all_result_cols.index('CONT LIST') + 1
+              if 'CONT LIST' in all_result_cols else None)   # 1-based
 
     def write_result_sheet(ws, df, sheet_title):
+        n_cols = len(all_result_cols)
         n_rows = len(df)
-        # Header row
-        for ci, cn in enumerate(all_result_cols):
-            ws.write(0, ci, cn, _hdr_fmt_for(cn))
-            ws.set_column(ci, ci, col_widths_map.get(cn, 14))
 
-        # Pre-build CONT LIST map  [WIN 7] groupby on full df
+        # Header
+        ws.append(all_result_cols)
+        for ci, cn in enumerate(all_result_cols, 1):
+            cell = ws.cell(row=1, column=ci)
+            _apply(cell, _hdr_key(cn))
+            ws.column_dimensions[get_column_letter(ci)].width = \
+                col_widths_map.get(cn, 14)
+
+        # Pre-build CONT LIST map [WIN 7]
         cont_list_map = {}
-        if cl_col_idx is not None and 'CONTAINER ID' in df.columns:
+        if cl_idx and 'CONTAINER ID' in df.columns:
             for (mh, bay), grp in df.groupby(['MOVE HOUR', 'BAY']):
                 ids = [str(v).strip() for v in grp['CONTAINER ID']
                        if str(v).strip() not in ('', 'nan')]
                 cont_list_map[(mh, bay)] = ', '.join(ids) if ids else ''
 
-        # [WIN 7] Convert to records once → fastest per-row access
+        # [WIN 7] to_dict once → fastest per-row iteration
         records = df.to_dict('records')
 
-        shade    = True
-        prev_gk  = None
-        for ri, rec in enumerate(records, 1):
+        # ── Bulk-append all data rows first (fastest path in openpyxl) ──
+        data_style_keys = []          # store style key per row for 2nd pass
+        shade = True; prev_gk = None
+        for rec in records:
             gk = (rec.get('MOVE HOUR'), rec.get('STS'), rec.get('BAY'),
                   rec.get('ASSIGNED BLOCK'), rec.get('WEIGHT CLASS'))
             if gk != prev_gk:
-                shade  = not shade
-                prev_gk = gk
-            f = F['data_w'] if shade else F['data_a']
-            for ci, cn in enumerate(all_result_cols):
-                if cn == 'CONT LIST': continue
-                val = rec.get(cn, '')
-                if cn in ('YB', 'YR', 'YT') and val != '':
-                    try: val = int(val)
+                shade = not shade; prev_gk = gk
+            sk = 'data_w' if shade else 'data_a'
+            data_style_keys.append(sk)
+
+            row_vals = []
+            for cn in all_result_cols:
+                if cn == 'CONT LIST':
+                    row_vals.append(None)
+                    continue
+                v = rec.get(cn, '')
+                if cn in INT_COLS and v != '':
+                    try: v = int(v)
                     except: pass
-                if val == '' or (isinstance(val, float) and str(val) == 'nan'):
-                    val = None
-                ws.write(ri, ci, val, f)
+                if v == '' or (isinstance(v, float) and str(v) == 'nan'):
+                    v = None
+                row_vals.append(v)
+            ws.append(row_vals)
 
-        # CONT LIST merges
-        if cl_col_idx is not None:
-            prev_key = None; grp_start = 1; n_ids_grp = 0
+        # ── 2nd pass: apply styles (row offset = 2 because row 1 = header) ──
+        for ri, sk in enumerate(data_style_keys, 2):
+            for ci in range(1, n_cols + 1):
+                if cl_idx and ci == cl_idx:
+                    continue    # CONT LIST styled separately below
+                _apply(ws.cell(row=ri, column=ci), sk)
 
-            def _flush(pk, gs, ge, nids):
-                text = cont_list_map.get(pk, '') or None
+        # ── CONT LIST: merge + style ──
+        if cl_idx:
+            prev_key = None; grp_start = 2; n_ids_grp = 0
+            def _flush_cl(pk, gs, ge, nids):
+                text = cont_list_map.get(pk) or None
                 if ge > gs:
-                    ws.merge_range(gs, cl_col_idx, ge, cl_col_idx,
-                                   text or '', F['cont_list'])
-                else:
-                    ws.write(gs, cl_col_idx, text, F['cont_list'])
+                    ws.merge_cells(start_row=gs, start_column=cl_idx,
+                                   end_row=ge,   end_column=cl_idx)
+                top_cell = ws.cell(row=gs, column=cl_idx)
+                top_cell.value = text
+                _apply(top_cell, 'cont_list')
                 span = ge - gs + 1
-                rh   = max(15, min(60, max(1, -(-nids // max(1, span))) * 13))
+                rh = max(15, min(60, max(1, -(-nids // max(1, span))) * 13))
                 for r in range(gs, ge + 1):
-                    ws.set_row(r, rh)
+                    ws.row_dimensions[r].height = rh
 
-            for ri, rec in enumerate(records, 1):
+            for ri, rec in enumerate(records, 2):
                 cur_key = (rec.get('MOVE HOUR', ''), rec.get('BAY', ''))
-                nids    = len([x for x in cont_list_map.get(cur_key, '').split(',')
-                               if x.strip()])
+                nids = len([x for x in cont_list_map.get(cur_key, '').split(',')
+                            if x.strip()])
                 if cur_key != prev_key:
                     if prev_key is not None:
-                        _flush(prev_key, grp_start, ri - 1, n_ids_grp)
+                        _flush_cl(prev_key, grp_start, ri - 1, n_ids_grp)
                     prev_key = cur_key; grp_start = ri; n_ids_grp = nids
             if prev_key is not None:
-                _flush(prev_key, grp_start, n_rows, n_ids_grp)
+                _flush_cl(prev_key, grp_start, n_rows + 1, n_ids_grp)
 
         print(f"  Sheet '{sheet_title}': {n_rows} rows written.")
 
@@ -776,7 +822,7 @@ def run_optimization(file_input):
     for st_idx, st_val in enumerate(st_values, 1):
         sname = (f"RESULT {st_idx} ({st_val})"
                  if st_val != 'ALL' else 'RESULT')[:31]
-        ws = wb.add_worksheet(sname)
+        ws = wb.create_sheet(sname)
         df_rd = (df_result_detail if st_val == 'ALL' else
                  df_result_detail[
                      df_result_detail['ST'].astype(str).str.strip()
@@ -784,12 +830,13 @@ def run_optimization(file_input):
                  ).reset_index(drop=True)
         write_result_sheet(ws, df_rd, sname)
 
-    ws_total = wb.add_worksheet('RESULT TOTAL')
+    ws_total = wb.create_sheet('RESULT TOTAL')
     write_result_sheet(ws_total,
                        df_result_detail.reset_index(drop=True),
                        'RESULT TOTAL')
 
-    wb.close()
+    excel_buffer = io.BytesIO()
+    wb.save(excel_buffer)
     excel_buffer.seek(0)
 
     t_end       = time.perf_counter()
