@@ -60,9 +60,9 @@ def _n_threads():
     except: return 1
 
 def _make_solver(time_limit=120, mip_gap=0.02):
-    """Dùng HiGHS API nếu có, nếu không dùng CBC (multithread). Truyền gap."""
+    """Ưu tiên HiGHS API → HiGHS CMD → CBC (đa luồng). Truyền gap."""
     n = _n_threads()
-    # Thử HiGHS API
+    # --- Thử HiGHS API (nhanh nhất) ---
     try:
         import highspy  # noqa
         solver = pulp.HiGHS(
@@ -77,12 +77,18 @@ def _make_solver(time_limit=120, mip_gap=0.02):
         return solver
     except Exception:
         pass
-    # Thử HiGHS CMD
+
+    # --- Thử HiGHS dòng lệnh ---
     try:
         solver = pulp.HiGHS_CMD(
             msg=True, timeLimit=time_limit,
-            options=[("parallel", "on"), ("threads", str(n)),
-                     ("mip_rel_gap", mip_gap)])
+            options=[
+                ("parallel", "on"),
+                ("threads", str(n)),
+                ("mip_rel_gap", mip_gap)
+            ]
+        )
+        # Kiểm tra nhanh xem có hoạt động không
         tp = pulp.LpProblem("_t", pulp.LpMinimize)
         tv = pulp.LpVariable("_v"); tp += tv; tp += tv >= 0
         tp.solve(solver)
@@ -90,18 +96,22 @@ def _make_solver(time_limit=120, mip_gap=0.02):
         return solver
     except Exception:
         pass
-    # CBC
+
+    # --- CBC đa luồng (có gap) ---
     try:
         solver = pulp.PULP_CBC_CMD(
             msg=True, timeLimit=time_limit, threads=n,
-            fracGap=mip_gap)
+            gapRel=mip_gap   # ← sửa fracGap thành gapRel
+        )
         print(f"[Solver] CBC ({n} threads, gap={mip_gap})")
         return solver
     except Exception:
         pass
-    print("[Solver] CBC (single thread)")
-    return pulp.PULP_CBC_CMD(msg=True, timeLimit=time_limit, fracGap=mip_gap)
 
+    # --- CBC mặc định (single thread, không gap) ---
+    print("[Solver] CBC (single thread)")
+    return pulp.PULP_CBC_CMD(msg=True, timeLimit=time_limit)
+  
 # ========== Move Hour sort key ==========
 _DAY_RANK = {'MO':0,'TU':1,'WE':2,'TH':3,'FR':4,'SA':5,'SU':6}
 def _hour_sort_key(h: str):
