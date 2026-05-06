@@ -1,15 +1,16 @@
 """
-Phiên bản tối ưu tốc độ – v3
-============================
-Thay đổi căn bản so với bản gốc:
-  1. Loại `block_bay_wc` ra khỏi MIP  → giảm số biến + constraints ~40-60%
-  2. Tinh chỉnh CBC / dùng HiGHS nếu có → giải nhanh hơn 3-10×
-  3. `pick_n` dùng blocked_count O(1)   → không còn O(n²) loop
-  4. Đo thời gian từng giai đoạn       → dễ debug nếu vẫn chậm
+Phiên bản siêu tốc – v4
+======================
+Cải tiến:
+  - Chỉ tạo y_var cho block thực sự đáp ứng được (ST/POD) 
+    → giảm mạnh biến nhị phân & ràng buộc.
+  - Warm‑start heuristic: gán job trước bằng thuật toán tham lam 
+    → solver bắt đầu từ nghiệm khả thi tốt.
+  - MIP gap (relGap) = 0.02 → dừng sớm hơn.
+  - Dùng HiGHS API (highspy) nếu có, nhanh hơn CMD.
+  - Tách biệt phần build model và warm start thành các hàm riêng.
 """
-import io
-import time
-import os
+import io, time, os
 import pandas as pd
 import numpy as np
 import pulp
@@ -18,26 +19,21 @@ from openpyxl.styles import Alignment, Font, PatternFill, Border, Side
 from collections import defaultdict
 
 # ============================================================
-# TUNING FLAGS  ← điều chỉnh tại đây nếu cần
+# TUNING FLAGS
 # ============================================================
-# True  = bỏ block_bay_wc khỏi MIP (nhanh hơn ~3×, chất lượng giảm nhẹ)
-# False = giữ nguyên hành vi gốc (chậm hơn nhưng tối ưu hơn về block_bay_wc)
-FAST_MODE = True
+FAST_MODE          = True   # True = bỏ block_bay_wc khỏi MIP
+USE_WARM_START     = True   # True = dùng heuristic khởi tạo
+MIP_GAP            = 0.02   # 2% gap (0.0 = tối ưu tuyệt đối)
+SOLVER_TIME_LIMIT  = 120    # seconds
 
-# Giới hạn thời gian solver (giây) — giảm từ 300 → 120
-SOLVER_TIME_LIMIT = 120
-
-# ============================================================
-# COLOR PALETTE & STYLE HELPERS
-# ============================================================
+# ========== Color Palette & Style ==========
 C_DARK_BLUE   = "FF1F4E79"
 C_MID_BLUE    = "FF2E75B6"
 C_LIGHT_BLUE  = "FF9DC3E6"
 C_PALE_BLUE   = "FFD6E4F0"
 C_ALT_ROW     = "FFEBF3FB"
 C_WHITE       = "FFFFFFFF"
-
-FONT_NAME = "Calibri"
+FONT_NAME     = "Calibri"
 
 def _font(bold=False, color="FF000000", size=10):
     return Font(name=FONT_NAME, bold=bold, color=color, size=size)
@@ -51,80 +47,157 @@ def _thin_border():
 def _style(ws, coord, value=None, bold=False, font_color="FF000000",
            fill_color=None, align="center", wrap=False, border=True, size=10):
     cell = ws[coord] if isinstance(coord, str) else coord
-    if value is not None:
-        cell.value = value
+    if value is not None: cell.value = value
     cell.font = _font(bold=bold, color=font_color, size=size)
-    if fill_color:
-        cell.fill = _fill(fill_color)
+    if fill_color: cell.fill = _fill(fill_color)
     cell.alignment = _align(h=align, wrap=wrap)
-    if border:
-        cell.border = _thin_border()
+    if border: cell.border = _thin_border()
     return cell
 
-# ============================================================
-# SOLVER HELPER
-# ============================================================
+# ========== Solver helper ==========
 def _n_threads():
-    try:
-        return max(1, os.cpu_count() or 1)
-    except Exception:
-        return 1
+    try: return max(1, os.cpu_count() or 1)
+    except: return 1
 
-def _make_solver(time_limit=120):
-    """Ưu tiên HiGHS → CBC-multithread → CBC đơn."""
+def _make_solver(time_limit=120, mip_gap=0.02):
+    """Dùng HiGHS API nếu có, nếu không dùng CBC (multithread). Truyền gap."""
     n = _n_threads()
-    # --- thử HiGHS ---
+    # Thử HiGHS API
     try:
-        import highspy  # noqa  (chỉ kiểm tra có cài không)
-        solver = pulp.HiGHS_CMD(
-            msg=True, timeLimit=time_limit,
-            options=[("parallel", "on"), ("threads", str(n))]
+        import highspy  # noqa
+        solver = pulp.HiGHS(
+            timeLimit=time_limit,
+            options={
+                "parallel": "on",
+                "threads": str(n),
+                "mip_rel_gap": mip_gap,
+            }
         )
-        tp = pulp.LpProblem("_t", pulp.LpMinimize)
-        tv = pulp.LpVariable("_v"); tp += tv; tp += tv >= 0
-        tp.solve(solver)
-        print(f"[Solver] HiGHS ({n} threads)  ← cài: pip install highspy")
+        print(f"[Solver] HiGHS API ({n} threads, gap={mip_gap})")
         return solver
     except Exception:
         pass
-    # --- CBC với threads ---
+    # Thử HiGHS CMD
     try:
-        solver = pulp.PULP_CBC_CMD(msg=True, timeLimit=time_limit, threads=n)
-        print(f"[Solver] CBC ({n} threads)")
+        solver = pulp.HiGHS_CMD(
+            msg=True, timeLimit=time_limit,
+            options=[("parallel", "on"), ("threads", str(n)),
+                     ("mip_rel_gap", mip_gap)])
+        tp = pulp.LpProblem("_t", pulp.LpMinimize)
+        tv = pulp.LpVariable("_v"); tp += tv; tp += tv >= 0
+        tp.solve(solver)
+        print(f"[Solver] HiGHS CMD ({n} threads, gap={mip_gap}) ← cài: pip install highspy")
+        return solver
+    except Exception:
+        pass
+    # CBC
+    try:
+        solver = pulp.PULP_CBC_CMD(
+            msg=True, timeLimit=time_limit, threads=n,
+            fracGap=mip_gap)
+        print(f"[Solver] CBC ({n} threads, gap={mip_gap})")
         return solver
     except Exception:
         pass
     print("[Solver] CBC (single thread)")
-    return pulp.PULP_CBC_CMD(msg=True, timeLimit=time_limit)
+    return pulp.PULP_CBC_CMD(msg=True, timeLimit=time_limit, fracGap=mip_gap)
 
-# ============================================================
-# MOVE HOUR SORT KEY
-# Format: +MO0600, +TU1200, +WE0000, +TH1800, +FR0000, +SA0600, +SU2200
-# Không thể sort alphabet vì +TH < +WE theo ABC nhưng TH > WE theo lịch
-# ============================================================
-_DAY_RANK = {'MO': 0, 'TU': 1, 'WE': 2, 'TH': 3, 'FR': 4, 'SA': 5, 'SU': 6}
-
+# ========== Move Hour sort key ==========
+_DAY_RANK = {'MO':0,'TU':1,'WE':2,'TH':3,'FR':4,'SA':5,'SU':6}
 def _hour_sort_key(h: str):
-    """
-    Trả về tuple (day_rank, time_int) để sort đúng thứ tự tuần.
-    Ví dụ: '+WE0600' → (2, 600),  '+TH0000' → (3, 0)
-    → +WE0600 < +TH0000 ✓
-    Fallback về (99, h) nếu format lạ → không crash.
-    """
     s = str(h).strip()
-    # Bỏ dấu '+' ở đầu nếu có
-    if s.startswith('+'):
-        s = s[1:]
-    if len(s) >= 2:
+    if s.startswith('+'): s = s[1:]
+    if len(s)>=2:
         day_code = s[:2].upper()
         time_str = s[2:].strip()
         day_rank = _DAY_RANK.get(day_code, 99)
-        try:
-            time_int = int(time_str) if time_str else 0
-        except ValueError:
-            time_int = 0
+        try: time_int = int(time_str) if time_str else 0
+        except: time_int = 0
         return (day_rank, time_int)
-    return (99, s)  # fallback
+    return (99, s)
+
+# ============================================================
+# HEURISTIC KHỞI TẠO (WARM START)
+# ============================================================
+def build_warm_start(job_keys, demands, supply, supply_keys,
+                     supply_blocks_by_st_pod, blocks, all_hours_sorted):
+    """
+    Trả về 2 dict:
+      y_init: {(h,s,bay,b): 0/1}
+      x_init: {(h,s,bay,b,dkey): quantity}
+    Nếu không thể gán toàn bộ, trả về ({}, {})
+    """
+    # Copy supply để trừ dần
+    avail_supply = {skey: dict(supply[skey]) for skey in supply_keys}
+    y_init = {}
+    x_init = {}
+    # Số job đã gán vào block trong mỗi hour (để tránh clash)
+    used_in_hour = defaultdict(lambda: defaultdict(int))
+
+    for h in all_hours_sorted:
+        # Lấy các job của hour này (s, bay)
+        hour_jobs = [(s,bay) for (hh,s,bay) in job_keys if hh == h]
+        for s, bay in hour_jobs:
+            job_dkeys = demands[(h,s,bay)]   # dict (w,st,pod) -> qty
+            # Xác định block khả dụng cho job này
+            allowed_blocks = set()
+            for dkey in job_dkeys:
+                w, st_v, pod_v = dkey
+                allowed_blocks.update(supply_blocks_by_st_pod.get((st_v,pod_v), []))
+            allowed_blocks = sorted(allowed_blocks, key=lambda b: (used_in_hour[h][b], b))
+
+            # Thử gán toàn bộ job vào 1 block
+            assigned = False
+            for b in allowed_blocks:
+                b_skey = (b, '', '')  # cần lấy đúng skey; truy vấn từ supply
+                # Tìm skey đúng (có thể nhiều skey cùng block nhưng khác st/pod)
+                skey_candidates = [sk for sk in supply_keys if sk[0]==b]
+                feasible = True
+                # Kiểm tra xem block có đủ supply cho tất cả dkey không
+                for dkey, qty in job_dkeys.items():
+                    w, st_v, pod_v = dkey
+                    cand_skey = (b, st_v, pod_v)
+                    if cand_skey not in avail_supply or avail_supply[cand_skey].get(w,0) < qty:
+                        feasible = False
+                        break
+                if feasible:
+                    # Gán toàn bộ
+                    y_init[(h,s,bay,b)] = 1
+                    used_in_hour[h][b] += 1
+                    for dkey, qty in job_dkeys.items():
+                        w, st_v, pod_v = dkey
+                        skey = (b, st_v, pod_v)
+                        avail_supply[skey][w] -= qty
+                        x_init[(h,s,bay,b,dkey)] = qty
+                    assigned = True
+                    break
+            if assigned:
+                continue
+
+            # Nếu không gán được toàn bộ, splits từng dkey
+            y_init[(h,s,bay,b)] = 0   # sẽ được gán nhiều block
+            for dkey, qty in job_dkeys.items():
+                w, st_v, pod_v = dkey
+                needed = qty
+                # Duyệt lại allowed_blocks (có thể khác tổ hợp st/pod)
+                for b in allowed_blocks:
+                    skey = (b, st_v, pod_v)
+                    if skey in avail_supply and avail_supply[skey].get(w,0) > 0:
+                        take = min(needed, avail_supply[skey][w])
+                        if take > 0:
+                            avail_supply[skey][w] -= take
+                            x_init[(h,s,bay,b,dkey)] = x_init.get((h,s,bay,b,dkey),0) + take
+                            needed -= take
+                            if (h,s,bay,b) not in y_init:
+                                y_init[(h,s,bay,b)] = 1
+                                used_in_hour[h][b] += 1
+                            if needed == 0:
+                                break
+                if needed > 0:
+                    # Không thể gán hết, trả về rỗng (không warm start)
+                    return {}, {}
+            # End split
+    return y_init, x_init
 
 # ============================================================
 # PUBLIC API
@@ -132,18 +205,15 @@ def _hour_sort_key(h: str):
 def run_optimization(file_input):
     t0 = time.perf_counter()
 
-    # ============================================================
-    # 1. ĐỌC DỮ LIỆU
-    # ============================================================
+    # ========== 1. Đọc dữ liệu ==========
     xls = pd.ExcelFile(file_input)
-
     df1 = pd.read_excel(xls, sheet_name='MOVEHOUR-WEIGHTCLASS', header=None)
-    has_st_pod = (str(df1.iloc[1, 2]).strip().upper() == 'ST')
+    has_st_pod = (str(df1.iloc[1,2]).strip().upper() == 'ST')
     data_col_start = 4 if has_st_pod else 2
 
     sts_bay_map = {}
     for col in range(data_col_start, df1.shape[1]):
-        sts = df1.iloc[0, col]; bay = df1.iloc[1, col]
+        sts = df1.iloc[0,col]; bay = df1.iloc[1,col]
         if pd.notna(sts) and pd.notna(bay):
             sts_bay_map[col] = (str(sts).strip(), str(bay).strip())
 
@@ -161,55 +231,56 @@ def run_optimization(file_input):
         pod_val = str(row[3]).strip() if has_st_pod and pd.notna(row[3]) else ''
         for col in range(data_col_start, df1.shape[1]):
             qty = row[col]
-            if pd.notna(qty) and qty != '':
+            if pd.notna(qty) and qty!='':
                 qty = int(float(str(qty)))
-                if qty > 0:
+                if qty>0:
                     sts, bay = sts_bay_map[col]
                     key = (hour, sts, bay)
                     demands.setdefault(key, {})
                     dkey = (weight, st_val, pod_val)
-                    demands[key][dkey] = demands[key].get(dkey, 0) + qty
+                    demands[key][dkey] = demands[key].get(dkey,0) + qty
 
-    print(f"Demand format: {'WC+ST+POD' if has_st_pod else 'WC only'}")
     job_keys = list(demands.keys())
-    # Dùng _hour_sort_key để sort đúng thứ tự tuần (+MO → +TU → ... → +SU)
-    # thay vì sort alphabet (sẽ đặt +TH trước +WE vì T < W)
-    all_hours_sorted = sorted(set(h for (h, s, b) in job_keys), key=_hour_sort_key)
-    hour_rank = {h: i for i, h in enumerate(all_hours_sorted)}
+    all_hours_sorted = sorted(set(h for (h,s,b) in job_keys), key=_hour_sort_key)
+    hour_rank = {h:i for i,h in enumerate(all_hours_sorted)}
     jobs_by_hour = defaultdict(list)
-    for (h, s, b) in job_keys:
-        jobs_by_hour[h].append((s, b))
+    for (h,s,b) in job_keys: jobs_by_hour[h].append((s,b))
     jobs_by_bay = defaultdict(list)
-    for (h, s, bay) in job_keys:
-        jobs_by_bay[bay].append((h, s, bay))
+    for (h,s,bay) in job_keys: jobs_by_bay[bay].append((h,s,bay))
 
     df2 = pd.read_excel(xls, sheet_name='BLOCK-WEIGHT CLASS', header=0)
     col_names = [str(c).strip() for c in df2.columns]
-    has_st_pod_supply = (col_names[1].upper() == 'ST' and col_names[2].upper() == 'POD')
+    has_st_pod_supply = (col_names[1].upper()=='ST' and col_names[2].upper()=='POD')
     wc_col_start = 3 if has_st_pod_supply else 1
 
-    supply = {}; blocks_set = set()
+    supply = {}
+    blocks_set = set()
     for _, row in df2.iterrows():
         block = str(row.iloc[0]).strip()
-        if block in ('nan', 'GRAND TOTAL', '') or not block: continue
+        if block in ('nan','GRAND TOTAL','') or not block: continue
         st_v  = str(row.iloc[1]).strip() if has_st_pod_supply else ''
         pod_v = str(row.iloc[2]).strip() if has_st_pod_supply else ''
         skey = (block, st_v, pod_v)
         wc_dict = {}
-        for wi, w in enumerate([1, 2, 3, 4, 5]):
+        for wi, w in enumerate([1,2,3,4,5]):
             ci = wc_col_start + wi
-            val = row.iloc[ci] if ci < len(row) else None
-            wc_dict[w] = int(val) if pd.notna(val) and val != '' else 0
+            val = row.iloc[ci] if ci<len(row) else None
+            wc_dict[w] = int(val) if pd.notna(val) and val!='' else 0
         supply[skey] = wc_dict
         blocks_set.add(block)
 
-    weight_classes = [1, 2, 3, 4, 5]
+    weight_classes = [1,2,3,4,5]
     blocks = sorted(blocks_set)
-    supply_keys = [k for k in supply if any(supply[k][w] > 0 for w in weight_classes)]
+    supply_keys = [k for k in supply if any(supply[k][w]>0 for w in weight_classes)]
+    supply_blocks_by_st_pod = defaultdict(list)
+    for b, st_v, pod_v in supply_keys:
+        supply_blocks_by_st_pod[(st_v, pod_v)].append(b)
+
+    print(f"Demand format: {'WC+ST+POD' if has_st_pod else 'WC only'}")
     print(f"Supply format: {'BLOCK+ST+POD' if has_st_pod_supply else 'BLOCK only'}")
     print(f"Supply keys: {len(supply_keys)}")
 
-    # Sheet DATA
+    # DATA sheet
     container_data_available = False
     try:
         df_containers = pd.read_excel(xls, sheet_name='DATA', header=0)
@@ -218,13 +289,13 @@ def run_optimization(file_input):
             for c in cands:
                 if c in cols: return c
             return None
-        wc_src  = find_col(['YC', 'Unnamed: 1'])
-        yp_src  = find_col(['YP', 'Unnamed: 2'])
-        id_src  = find_col(['ID', 'Unnamed: 3'])
+        wc_src  = find_col(['YC','Unnamed: 1'])
+        yp_src  = find_col(['YP','Unnamed: 2'])
+        id_src  = find_col(['ID','Unnamed: 3'])
         st_src  = find_col(['ST']); pod_src = find_col(['POD'])
         required_found = wc_src and yp_src and all(c in cols for c in ['YB','YR','YT'])
         if required_found:
-            df_containers = df_containers.dropna(subset=[wc_src, yp_src, 'YB','YR','YT']).copy()
+            df_containers = df_containers.dropna(subset=[wc_src,yp_src,'YB','YR','YT']).copy()
             df_containers['REAL_WC']      = df_containers[wc_src].astype(float).astype(int)
             df_containers['YARD_POS']     = df_containers[yp_src].astype(str).str.strip()
             df_containers['REAL_CONT_ID'] = (df_containers[id_src].fillna('').astype(str).str.strip()
@@ -242,180 +313,206 @@ def run_optimization(file_input):
         print(f"No DATA sheet. ({e})")
 
     # Stacking
-    yb_wc_supply = {}; stack_ordering = {}; blocking_pairs = []
+    yb_wc_supply = {}
+    stack_ordering = {}
+    blocking_pairs = []
     if container_data_available:
         df_c = df_containers[['YARD','YB','YR','YT','REAL_WC','YARD_POS',
                                'REAL_CONT_ID','CONT_ST','CONT_POD']].copy()
         for block in blocks:
-            bdf = df_c[df_c['YARD'] == block]
+            bdf = df_c[df_c['YARD']==block]
             if bdf.empty: continue
-            yb_wc_supply[block] = {}; stack_ordering[block] = {}
+            yb_wc_supply[block] = {}
+            stack_ordering[block] = {}
             for yb, yb_df in bdf.groupby('YB'):
-                yb_wc_supply[block][yb] = {wc: int(cnt) for wc,cnt in yb_df.groupby('REAL_WC').size().items()}
+                yb_wc_supply[block][yb] = {wc:int(cnt) for wc,cnt in yb_df.groupby('REAL_WC').size().items()}
                 stack_ordering[block][yb] = {}
                 for yr, yr_df in yb_df.groupby('YR'):
-                    ordered = yr_df.sort_values('YT', ascending=False)[['YT','REAL_WC']].values.tolist()
+                    ordered = yr_df.sort_values('YT',ascending=False)[['YT','REAL_WC']].values.tolist()
                     stack_ordering[block][yb][yr] = [(int(t),int(w)) for t,w in ordered]
                 for yr, tiers in stack_ordering[block][yb].items():
                     wcs_above = []
                     for tier, wc in tiers:
                         for prev_wc, prev_tier in wcs_above:
                             if prev_wc != wc:
-                                blocking_pairs.append((block, yb, yr, prev_tier, prev_wc, tier, wc))
-                        wcs_above.append((wc, tier))
+                                blocking_pairs.append((block,yb,yr,prev_tier,prev_wc,tier,wc))
+                        wcs_above.append((wc,tier))
         print(f"Stacking: {len(blocking_pairs)} blocking pairs.")
 
-    # ============================================================
-    # 2. DEMAND / SUPPLY CHECK
-    # ============================================================
+    # Balance check
     total_demand = defaultdict(int)
     for job in job_keys:
-        for dkey, qty in demands[job].items():
+        for dkey,qty in demands[job].items():
             total_demand[dkey] += qty
     total_supply = defaultdict(int)
     for skey in supply_keys:
-        b, st_v, pod_v = skey
+        b,st_v,pod_v = skey
         for w in weight_classes:
-            total_supply[(w, st_v, pod_v)] += supply[skey][w]
-
+            total_supply[(w,st_v,pod_v)] += supply[skey][w]
     ok = True
-    for k in set(list(total_demand) + list(total_supply)):
-        d = total_demand.get(k, 0); s = total_supply.get(k, 0)
-        if d != s:
+    for k in set(list(total_demand)+list(total_supply)):
+        d = total_demand.get(k,0); s = total_supply.get(k,0)
+        if d!=s:
             print(f"  ERROR Mismatch WC={k[0]} ST={k[1]} POD={k[2]}: demand={d}, supply={s}")
             ok = False
-    if not ok:
-        raise ValueError("Demand/supply mismatch.")
+    if not ok: raise ValueError("Demand/supply mismatch.")
     print("Demand/supply balanced OK.")
 
     t_read = time.perf_counter()
-    print(f"[TIMER] Đọc dữ liệu: {t_read - t0:.1f}s")
+    print(f"[TIMER] Đọc dữ liệu: {t_read-t0:.1f}s")
 
-    # ============================================================
-    # 3. XÂY DỰNG VÀ GIẢI MIP
-    # ============================================================
-    print(f"[MIP] FAST_MODE={'ON (bỏ block_bay_wc)' if FAST_MODE else 'OFF (đầy đủ)'}")
+    # ========== 2. Heuristic warm start ==========
+    y_init = {}; x_init = {}
+    if USE_WARM_START:
+        print("Building warm-start heuristic...")
+        y_init, x_init = build_warm_start(
+            job_keys, demands, supply, supply_keys,
+            supply_blocks_by_st_pod, blocks, all_hours_sorted)
+        if y_init:
+            print(f"Warm-start OK: {len(y_init)} y=1, {len(x_init)} x>0.")
+        else:
+            print("Warm-start không khả thi, sẽ giải từ đầu.")
 
+    # ========== 3. Xây dựng MIP ==========
+    print(f"[MIP] FAST_MODE={'ON' if FAST_MODE else 'OFF'}"
+          f", WARM_START={'ON' if y_init else 'OFF'}")
     prob = pulp.LpProblem("Minimize_Clashes", pulp.LpMinimize)
 
-    # y_vars
-    y_vars = {(h, s, bay, b): pulp.LpVariable(f"y_{h}_{s}_{bay}_{b}", cat='Binary')
-              for (h, s, bay) in job_keys for b in blocks}
-
-    # Pre-index blocks theo (st, pod) để tạo x_vars nhanh
-    supply_blocks_by_st_pod = defaultdict(list)
-    for b, st_v, pod_v in supply_keys:
-        supply_blocks_by_st_pod[(st_v, pod_v)].append(b)
-
-    x_vars = {}
+    # Tạo y_vars: chỉ cho block khả dụng (dựa trên ST/POD của job)
+    y_vars = {}
     for (h, s, bay) in job_keys:
-        for dkey in demands[(h, s, bay)]:
+        allowed_blocks = set()
+        for dkey in demands[(h,s,bay)]:
             w, st_v, pod_v = dkey
-            for b in supply_blocks_by_st_pod.get((st_v, pod_v), []):
-                x_vars[(h, s, bay, b, dkey)] = pulp.LpVariable(
-                    f"x_{h}_{s}_{bay}_{b}_{w}_{st_v}_{pod_v}", lowBound=0, cat='Integer')
+            allowed_blocks.update(supply_blocks_by_st_pod.get((st_v,pod_v), []))
+        for b in allowed_blocks:
+            var = pulp.LpVariable(f"y_{h}_{s}_{bay}_{b}", cat='Binary')
+            y_vars[(h,s,bay,b)] = var
+            # Warm start
+            if y_init and (h,s,bay,b) in y_init:
+                var.setInitialValue(y_init[(h,s,bay,b)])
 
-    # u / e vars
+    # x_vars: chỉ cho block có trong allowed_blocks (như cũ)
+    x_vars = {}
+    for (h,s,bay) in job_keys:
+        for dkey in demands[(h,s,bay)]:
+            w,st_v,pod_v = dkey
+            for b in supply_blocks_by_st_pod.get((st_v,pod_v), []):
+                # chỉ tạo nếu b nằm trong allowed_blocks (tương đương)
+                if (h,s,bay,b) not in y_vars:
+                    continue
+                var = pulp.LpVariable(f"x_{h}_{s}_{bay}_{b}_{w}_{st_v}_{pod_v}",
+                                      lowBound=0, cat='Integer')
+                x_vars[(h,s,bay,b,dkey)] = var
+                if x_init and (h,s,bay,b,dkey) in x_init:
+                    var.setInitialValue(x_init[(h,s,bay,b,dkey)])
+
+    # u, e vars
     u_vars = {}; e_vars = {}
     for h in jobs_by_hour:
         for b in blocks:
-            u_vars[(h, b)] = pulp.LpVariable(f"u_{h}_{b}", lowBound=0, cat='Integer')
-            e_vars[(h, b)] = pulp.LpVariable(f"e_{h}_{b}", lowBound=0, cat='Integer')
-            y_list = [y_vars[(h, s, bay, b)] for (s, bay) in jobs_by_hour[h]]
-            prob += u_vars[(h, b)] == pulp.lpSum(y_list)
-            prob += e_vars[(h, b)] >= u_vars[(h, b)] - 1
+            u_var = pulp.LpVariable(f"u_{h}_{b}", lowBound=0, cat='Integer')
+            u_vars[(h,b)] = u_var
+            e_var = pulp.LpVariable(f"e_{h}_{b}", lowBound=0, cat='Integer')
+            e_vars[(h,b)] = e_var
+            y_list = [y_vars[key] for (s,bay) in jobs_by_hour[h]
+                      if (key:=(h,s,bay,b)) in y_vars]
+            prob += u_var == pulp.lpSum(y_list)
+            prob += e_var >= u_var - 1
 
-    CLASH_W = 100.0; SINGLE_W = 10.0; SPREAD_W = 5.0; BAY_SINGLE_W = 10.0
+    CLASH_W=100.0; SINGLE_W=10.0; SPREAD_W=5.0; BAY_SINGLE_W=10.0
 
     single_block = {}
-    for (h, s, bay) in job_keys:
-        single_block[(h, s, bay)] = pulp.LpVariable(
-            f"sb_{h}_{s}_{bay}", lowBound=0, upBound=1, cat='Continuous')
-        prob += single_block[(h, s, bay)] >= (
-            2 - pulp.lpSum(y_vars[(h, s, bay, b)] for b in blocks))
+    for (h,s,bay) in job_keys:
+        var = pulp.LpVariable(f"sb_{h}_{s}_{bay}", lowBound=0, upBound=1, cat='Continuous')
+        single_block[(h,s,bay)] = var
+        y_sum = [y_vars[(h,s,bay,b)] for b in blocks if (h,s,bay,b) in y_vars]
+        prob += var >= (2 - pulp.lpSum(y_sum))
 
-    all_bays = sorted(set(bay for (_, _, bay) in job_keys))
-
+    all_bays = sorted(set(bay for (_,_,bay) in job_keys))
     block_bay = {}
     for b in blocks:
         for bay in all_bays:
             var = pulp.LpVariable(f"bb_{b}_{bay}", cat='Binary')
-            block_bay[(b, bay)] = var
-            for (h, s, bj) in jobs_by_bay[bay]:
-                prob += var >= y_vars[(h, s, bay, b)]
+            block_bay[(b,bay)] = var
+            for (h,s,bj) in jobs_by_bay[bay]:
+                key = (h,s,bay,b)
+                if key in y_vars:
+                    prob += var >= y_vars[key]
 
     bay_single = {}
     for bay in all_bays:
         var = pulp.LpVariable(f"bs_{bay}", lowBound=0, upBound=1, cat='Continuous')
         bay_single[bay] = var
-        prob += var >= (2 - pulp.lpSum(block_bay[(b, bay)] for b in blocks))
+        bb_sum = [block_bay[(b,bay)] for b in blocks]
+        prob += var >= (2 - pulp.lpSum(bb_sum))
     for bay in all_bays:
-        prob += pulp.lpSum(block_bay[(b, bay)] for b in blocks) >= 2
+        prob += pulp.lpSum(block_bay[(b,bay)] for b in blocks) >= 2
 
-    # block_bay_wc — CHỈ khi FAST_MODE = False
     block_bay_wc = {}
     if not FAST_MODE:
         x_by_bbw = defaultdict(list)
-        for (h, s, bay, b, dkey), xvar in x_vars.items():
-            x_by_bbw[(b, bay, dkey[0])].append((xvar, demands[(h, s, bay)][dkey]))
+        for (h,s,bay,b,dkey), xvar in x_vars.items():
+            x_by_bbw[(b,bay,dkey[0])].append((xvar, demands[(h,s,bay)][dkey]))
         for b in blocks:
             for bay in all_bays:
                 for wc in weight_classes:
-                    entries = x_by_bbw.get((b, bay, wc), [])
+                    entries = x_by_bbw.get((b,bay,wc), [])
                     if not entries: continue
                     var = pulp.LpVariable(f"bbw_{b}_{bay}_{wc}", cat='Binary')
-                    block_bay_wc[(b, bay, wc)] = var
+                    block_bay_wc[(b,bay,wc)] = var
                     for xvar, d in entries:
                         prob += var >= xvar / (d + 0.1)
 
     # Objective
-    obj = (CLASH_W    * pulp.lpSum(e_vars.values()) +
-           SINGLE_W   * pulp.lpSum(single_block.values()) +
-           SPREAD_W   * pulp.lpSum(block_bay.values()) +
+    obj = (CLASH_W * pulp.lpSum(e_vars.values()) +
+           SINGLE_W * pulp.lpSum(single_block.values()) +
+           SPREAD_W * pulp.lpSum(block_bay.values()) +
            BAY_SINGLE_W * pulp.lpSum(bay_single.values()))
     if block_bay_wc:
         obj += 2.0 * pulp.lpSum(block_bay_wc.values())
     prob += obj
 
-    # Demand constraints (pre-built list)
-    for (h, s, bay) in job_keys:
-        for dkey, d in demands[(h, s, bay)].items():
-            w, st_v, pod_v = dkey
-            x_list = [x_vars[(h, s, bay, b, dkey)]
-                      for b in supply_blocks_by_st_pod.get((st_v, pod_v), [])
-                      if (h, s, bay, b, dkey) in x_vars]
+    # Constraints
+    # Demand
+    for (h,s,bay) in job_keys:
+        for dkey, d in demands[(h,s,bay)].items():
+            x_list = [x_vars[(h,s,bay,b,dkey)]
+                      for b in supply_blocks_by_st_pod.get((dkey[1],dkey[2]), [])
+                      if (h,s,bay,b,dkey) in x_vars]
             if x_list:
                 prob += pulp.lpSum(x_list) == d
 
-    # Supply constraints (pre-indexed)
+    # Supply
     x_by_supply = defaultdict(list)
-    for (h, s, bay, b, dkey), xvar in x_vars.items():
-        w, st_v, pod_v = dkey
-        x_by_supply[(b, st_v, pod_v, w)].append(xvar)
+    for (h,s,bay,b,dkey), xvar in x_vars.items():
+        w,st_v,pod_v = dkey
+        x_by_supply[(b,st_v,pod_v,w)].append(xvar)
     for skey in supply_keys:
-        b, st_v, pod_v = skey
+        b,st_v,pod_v = skey
         for w in weight_classes:
-            xl = x_by_supply.get((b, st_v, pod_v, w), [])
+            xl = x_by_supply.get((b,st_v,pod_v,w), [])
             if xl:
                 prob += pulp.lpSum(xl) <= supply[skey][w]
 
-    # Linking x <= d*y
-    for (h, s, bay) in job_keys:
-        for dkey, d in demands[(h, s, bay)].items():
-            for b in supply_blocks_by_st_pod.get((dkey[1], dkey[2]), []):
-                key = (h, s, bay, b, dkey)
-                if key in x_vars:
-                    prob += x_vars[key] <= d * y_vars[(h, s, bay, b)]
+    # Linking
+    for (h,s,bay) in job_keys:
+        for dkey, d in demands[(h,s,bay)].items():
+            for b in supply_blocks_by_st_pod.get((dkey[1],dkey[2]), []):
+                key = (h,s,bay,b,dkey)
+                if key in x_vars and (h,s,bay,b) in y_vars:
+                    prob += x_vars[key] <= d * y_vars[(h,s,bay,b)]
 
     t_build = time.perf_counter()
     nv = len(prob.variables()); nc = len(prob.constraints)
-    print(f"[TIMER] Build model: {t_build - t_read:.1f}s  |  vars={nv}, constraints={nc}")
+    print(f"[TIMER] Build model: {t_build-t_read:.1f}s  |  vars={nv}, constraints={nc}")
 
-    solver = _make_solver(SOLVER_TIME_LIMIT)
+    # ========== 4. Solve ==========
+    solver = _make_solver(SOLVER_TIME_LIMIT, MIP_GAP)
     prob.solve(solver)
 
     t_solve = time.perf_counter()
-    print(f"[TIMER] Solver: {t_solve - t_build:.1f}s")
+    print(f"[TIMER] Solver: {t_solve-t_build:.1f}s")
     print(f"Status: {pulp.LpStatus[prob.status]}")
     if prob.status == pulp.LpStatusInfeasible:
         raise RuntimeError("Model infeasible.")
