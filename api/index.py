@@ -227,7 +227,7 @@ HTML_PAGE = """
 </head>
 <body>
 <div class="container">
-    <h1>⚙️ HỆ THỐNG PHÂN BỔ TỐI ƯU TỰ ĐỘNG</h1>
+    <h1>⚙️ HỆ THỐNG PHÂN BỔ TỐI ƯU</h1>
     <div class="sub">Tối ưu container theo MOVEHOUR &amp; WEIGHTCLASS</div>
 
     <!-- Vùng upload -->
